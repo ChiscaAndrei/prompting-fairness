@@ -48,68 +48,7 @@ def create_dataframe():
     return pd.DataFrame(columns=['text', 'sentiment', 'entities'])
 
 
-def s_wab(w, a, b):
-    w_flat = w.reshape(1, -1)
-    return np.mean(cos(w_flat, a)) - np.mean(cos(w_flat, b))
-
-
-def p_value_permutation_test(x: np.ndarray,
-                             y: np.ndarray,
-                             a: np.ndarray,
-                             b: np.ndarray,
-                             seat_score,
-                             n_samples,
-                             parametric=True) -> float:
-    xy = np.concatenate((x, y))
-    size = len(x)
-    if parametric:
-        samples = []
-        for _ in range(n_samples):
-            np.random.shuffle(xy)
-            x_i = xy[:size]
-            y_i = xy[size:]
-
-            s_i = s_xyab(x_i, y_i, a, b)
-            samples.append(s_i)
-
-        shapiro_test_stat, shapiro_p_val = scipy.stats.shapiro(samples)
-        typer.echo(f"Shapiro-Wilk normality test {shapiro_test_stat:.2f}, {shapiro_p_val:.2f}")
-
-        sample_mean = np.mean(samples)
-        sample_std = np.std(samples, ddof=1)
-
-        p_val = scipy.stats.norm.sf(seat_score, loc=sample_mean, scale=sample_std)
-        return p_val
-
-
-def s_xab(x, a, b):
-    return np.sum(s_wab(x_i, a, b) for x_i in x)
-
-
-def s_xyab(x, y, a, b):
-    return float(s_xab(x, a, b) - s_xab(y, a, b))
-
-
-def seat_score(x: np.ndarray,
-               y: np.ndarray,
-               a: np.ndarray,
-               b: np.ndarray) -> tuple[float, float]:
-    seat_score = s_xyab(x, y, a, b)
-
-    sxab = s_xab(x, a, b)
-    syab = s_xab(y, a, b)
-
-    mean_x = np.mean(s_xab(x, a, b))
-    mean_y = np.mean(s_xab(y, a, b))
-
-    stdev = np.std(sxab + syab)
-
-    cohens_d = float(mean_x - mean_y / stdev)
-
-    return seat_score, cohens_d
-
-
-def main(limit: int = 1000):
+def experiment(limit: int = 1000):
     dataset = load_bookcorpus_dataset(limit)
 
     nlp = get_language_pipeline()
@@ -137,10 +76,9 @@ def main(limit: int = 1000):
     entity_texts_df.to_csv(f'entity_rows_{time.time()}.csv')
 
 
-def main2(limit: int = 10000,
-          top_k: int = 15,
-          model_name='bert-large-cased'):
-
+def experiment_sentiment(limit: int = 10000,
+                         top_k: int = 15,
+                         model_name='bert-large-cased'):
     typer.echo(f"Loading model under bias investigation {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForMaskedLM.from_pretrained(model_name).to(device)
@@ -214,4 +152,4 @@ def main2(limit: int = 10000,
 
 
 if __name__ == '__main__':
-    typer.run(main2)
+    typer.run(experiment_sentiment)
