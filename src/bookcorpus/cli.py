@@ -5,7 +5,7 @@ import spacy
 import torch
 import transformers
 import typer
-from datasets import load_dataset
+from datasets.load import load_dataset
 import time
 import pandas as pd
 import asent  # noqa
@@ -35,6 +35,7 @@ def fill_templates(terms, templates):
 
 def get_language_pipeline():
     nlp = spacy.load("en_core_web_md")
+    nlp.disable_pipes("tok2vec", "tagger", "parser", "attribute_ruler", "lemmatizer")
     nlp.add_pipe('sentencizer')
     nlp.add_pipe('asent_en_v1')
     return nlp
@@ -47,6 +48,12 @@ def load_bookcorpus_dataset(limit: int):
 def create_dataframe():
     return pd.DataFrame(columns=['text', 'sentiment', 'entities'])
 
+def divide_in_batches(dataset : list[str], batch_size : int = 1024):
+    """
+    Generator for dividing a dataset into batches
+    """
+    for i in range(0, len(dataset), batch_size):
+        yield dataset[i:(i+batch_size)]
 
 def experiment(limit: int = 1000):
     dataset = load_bookcorpus_dataset(limit)
@@ -78,7 +85,9 @@ def experiment(limit: int = 1000):
 
 def experiment_sentiment(limit: int = 10000,
                          top_k: int = 15,
-                         model_name='bert-large-cased'):
+                         model_name='bert-large-cased',
+                         n_processes: int = typer.Option(1, help="Number of processes to use for NER (-1 to use all cores)."),
+                         batch_size: int = 16384):
     typer.echo(f"Loading model under bias investigation {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForMaskedLM.from_pretrained(model_name).to(device)
@@ -91,25 +100,23 @@ def experiment_sentiment(limit: int = 10000,
 
     typer.echo("Loading language pipeline...")
     nlp = get_language_pipeline()
+    typer.echo(f"   Active pipeline steps: {nlp.pipe_names}")
 
     entities_sentiment_scores = defaultdict(list)
 
     typer.echo("Processing data...")
-    # For each row
-
-    for text in tqdm(dataset['text']):
-
-        # Process the text for entities and sentiment
-        doc = nlp(text)
-
-        entities = doc.ents
-
-        # Check for names. If there is a name, calculate the sentiment score for the sentence
-        for entity in entities:
-            if entity.label_ == 'PERSON' and entity.text not in invalid_entities and len(entity.text.split()) <= 1:
-                # Append the sentiment score to the value of the entity name in the dict.
-                sentiment = mean([dict(sentence._.polarity)['compound'] for sentence in doc.sents])
-                entities_sentiment_scores[entity.text].append(sentiment)
+    with tqdm(total=limit) as pbar:
+        for dataset_batch in divide_in_batches(dataset['text'], batch_size=batch_size):
+            doc_batch = nlp.pipe(dataset_batch, n_process=n_processes)
+            for doc in doc_batch:
+                entities = doc.ents
+                # Check for names. If there is a name, calculate the sentiment score for the sentence
+                for entity in entities:
+                    if entity.label_ == 'PERSON' and entity.text not in invalid_entities and len(entity.text.split()) <= 1:
+                        # Append the sentiment score to the value of the entity name in the dict.
+                        sentiment = mean([dict(sentence._.polarity)['compound'] for sentence in doc.sents])
+                        entities_sentiment_scores[entity.text].append(sentiment)
+            pbar.update(len(dataset_batch))
 
     typer.echo("Computing average sentiment scores per entity...")
 
