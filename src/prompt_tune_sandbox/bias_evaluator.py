@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from src.bookcorpus.seat_utils import run_test
 from src.prompt_tune_sandbox.bias_template import prepare_dataset_for_masked_model
+from src.prompt_tune_sandbox.bias_template import create_positional_ids, PositionIdAdjustmentType
 
 class BiasEvaluatorForBert:
     
@@ -24,14 +25,14 @@ class BiasEvaluatorForBert:
                 self.seat_templates[name] = json.load(json_file)
 
 
-    def evaluate(self, model, tokenizer, prompt_length=0, return_embeddings=True):
+    def evaluate(self, model, tokenizer, prompt_length=0, return_embeddings=True, position_id_adjustment = PositionIdAdjustmentType.none):
         seat_results = {}
         seat_embeddings = {}
         for seat_test_name, seat_template in self.seat_templates.items():
             seat_results[seat_test_name], seat_embeddings[seat_test_name] = self.evaluate_seat(
-                seat_template, model, tokenizer, prompt_length)
+                seat_template, model, tokenizer, prompt_length, position_id_adjustment)
         
-        occupation_dataset_statistics = self.evaluate_training_occupation_dataset(model, tokenizer, prompt_length)
+        occupation_dataset_statistics = self.evaluate_training_occupation_dataset(model, tokenizer, prompt_length, position_id_adjustment)
 
         return_value = {
             "seat_results": seat_results,
@@ -48,25 +49,30 @@ class BiasEvaluatorForBert:
                text: str,
                model,
                tokenizer,
-               prompt_length):
+               prompt_length,
+               position_id_adjustment=PositionIdAdjustmentType.none,
+               ):
         tokens = tokenizer(text, return_tensors='pt').to(model.device)
-        outputs = model(**tokens, output_hidden_states=True)
+        batch_size = tokens["input_ids"].size(0)
+        seq_length = tokens["input_ids"].size(1)
+        position_ids = create_positional_ids(batch_size, seq_length, prompt_length, model.device, position_id_adjustment)
+        outputs = model(**tokens, position_ids=position_ids, output_hidden_states=True)
 
         # hidden_states [batch, seq_len, d_hidden]
         hidden_states = outputs.hidden_states[-1]
 
         return hidden_states[:, prompt_length, :].squeeze().detach().cpu().numpy()
 
-    def evaluate_seat(self, seat_template, model, tokenizer, prompt_length):
+    def evaluate_seat(self, seat_template, model, tokenizer, prompt_length, position_id_adjustment=PositionIdAdjustmentType.none):
         with torch.no_grad():
             targ1_embeddings = np.array(
-                [self.encode(sample, model, tokenizer, prompt_length) for sample in seat_template["targ1"]["examples"]])
+                [self.encode(sample, model, tokenizer, prompt_length, position_id_adjustment) for sample in seat_template["targ1"]["examples"]])
             targ2_embeddings = np.array(
-                [self.encode(sample, model, tokenizer, prompt_length) for sample in seat_template["targ2"]["examples"]])
+                [self.encode(sample, model, tokenizer, prompt_length, position_id_adjustment) for sample in seat_template["targ2"]["examples"]])
             attr1_embeddings = np.array(
-                [self.encode(sample, model, tokenizer, prompt_length) for sample in seat_template["attr1"]["examples"]])
+                [self.encode(sample, model, tokenizer, prompt_length, position_id_adjustment) for sample in seat_template["attr1"]["examples"]])
             attr2_embeddings = np.array(
-                [self.encode(sample, model, tokenizer, prompt_length) for sample in seat_template["attr2"]["examples"]])
+                [self.encode(sample, model, tokenizer, prompt_length, position_id_adjustment) for sample in seat_template["attr2"]["examples"]])
 
         labels = (targ1_embeddings.shape[0] * [seat_template["targ1"]["category"]+"(targ1)"]) +\
             (targ2_embeddings.shape[0] * [seat_template["targ2"]["category"]+"(targ2)"]) +\
@@ -90,7 +96,7 @@ class BiasEvaluatorForBert:
         return seat_result, ("embedding", embedding_result)
 
     @torch.no_grad()
-    def evaluate_training_occupation_dataset(self, model, tokenizer, prompt_length):
+    def evaluate_training_occupation_dataset(self, model, tokenizer, prompt_length, position_id_adjustment=PositionIdAdjustmentType.none):
         dataset = prepare_dataset_for_masked_model(tokenizer)
         dataset.set_format("torch")
         device = model.device
@@ -105,8 +111,11 @@ class BiasEvaluatorForBert:
 
         batch_size = len(dataset)
 
-        output_male = model(input_ids_male, attention_mask=attention_mask_male)
-        output_female = model(input_ids_female, attention_mask=attention_mask_female)
+        position_ids_male = create_positional_ids(input_ids_male.size(0), input_ids_male.size(1), prompt_length, device, position_id_adjustment)
+        position_ids_female = create_positional_ids(input_ids_female.size(0), input_ids_female.size(1), prompt_length, device, position_id_adjustment)
+
+        output_male = model(input_ids_male, attention_mask=attention_mask_male, position_ids=position_ids_male)
+        output_female = model(input_ids_female, attention_mask=attention_mask_female, position_ids=position_ids_female)
         # shape i: [batch_size, seq_len, vocab_size]
         # The model will also return the logits for the prompt tokens, so the output seq_len is larger than the input
 

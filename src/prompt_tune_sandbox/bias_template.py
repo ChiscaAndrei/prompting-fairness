@@ -1,5 +1,6 @@
 from string import Template
 from datasets import Dataset
+from enum import Enum
 import torch
 import os
 import json
@@ -18,6 +19,14 @@ current_dir = os.path.dirname(__file__)
 occupation_file_path = f"{current_dir}/occupation_options/occupations_large.json"
 with open(occupation_file_path, "r") as json_file:
     occupation_options = json.load(json_file)
+occupation_gender_specific_file_path = f"{current_dir}/occupation_options/occupations_gender_specific.json"
+with open(occupation_gender_specific_file_path, "r") as json_file:
+    occupation_options_male = []
+    occupation_options_female = []
+    specific_options = json.load(json_file)
+    for m, f in specific_options:
+        occupation_options_male.append(m)
+        occupation_options_female.append(f)
 
 gendered_options = {
     "male" : {
@@ -140,7 +149,38 @@ gender_occupation_templates = [
 ]
 
 
-def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False):
+class PositionIdAdjustmentType(str, Enum):
+    none = "none"  # Do no adjustment
+    cls_first = "cls_first"  # Adjust such that the cls token is first, then the prompt, and then ordinary text
+    start_1 = "start_1" # Start position ids from 1 : [1,2,3,...]
+    start_2 = "start_2" # Start position ids from 2 : [2,3,4,...]
+    start_3 = "start_3" # Start position ids from 3 : [3,4,5,...]
+
+def create_positional_ids(batch_size, sequence_size, prompt_size, device, adjustment_method=PositionIdAdjustmentType.none):
+    """
+    Creates position_ids to be used as input to a masked model
+    """
+    offset_vals = {
+        PositionIdAdjustmentType.start_1 : 1,
+        PositionIdAdjustmentType.start_2 : 2,
+        PositionIdAdjustmentType.start_3 : 3,
+    }
+    if adjustment_method == PositionIdAdjustmentType.none:
+        return None
+    elif adjustment_method == PositionIdAdjustmentType.cls_first:
+        position_ids = torch.zeros((batch_size, prompt_size+sequence_size), dtype=torch.long)
+        position_ids[:,:prompt_size] = torch.arange(prompt_size)
+        position_ids[:,prompt_size+1:] = torch.arange(prompt_size, prompt_size+sequence_size-1)
+        # position_ids [:,prompt_size], which corresponds to the CLS token, will remain 0
+        return position_ids.to(device)
+    elif adjustment_method in offset_vals.keys():
+        offset = offset_vals[adjustment_method]
+        position_ids = torch.zeros((batch_size, prompt_size+sequence_size), dtype=torch.long)
+        position_ids[:,:] = torch.arange(offset, prompt_size+sequence_size+offset)
+        return position_ids.to(device)
+
+
+def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False, model=None):
     used_templates = [t for t in gender_occupation_templates if "${occupation}" in t.template]
 
     # replace gendered placeholders with male choices
@@ -174,20 +214,27 @@ def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False
     replaced_male = [s[:1].upper() + s[1:] for s in replaced_male]
     replaced_female = [s[:1].upper() + s[1:] for s in replaced_female]
 
-    occupation_options_token_ids = []
-
-    for option in occupation_options:
-        token_id = tokenizer.convert_tokens_to_ids([option])[0]
-        if token_id == tokenizer.unk_token_id:
-            print(f"[WARNING] Option '{option}' is not a valid token")
-        else:
-            occupation_options_token_ids.append(token_id)
-
-    if len(occupation_options_token_ids) > len(set(occupation_options_token_ids)):
-        print("[WARNING] There are duplicate token ids for occupation options")
-
     if len(replaced_male) != len(replaced_female):
         raise RuntimeError("There should be an equal number of samples in each category")
+
+    def create_occupation_token_ids(options):
+        options_token_ids = []
+        for option in options:
+            token_id = tokenizer.convert_tokens_to_ids([option])[0]
+            if token_id == tokenizer.unk_token_id:
+                print(f"[WARNING] Option '{option}' is not a valid token")
+            else:
+                if token_id not in options_token_ids:
+                    options_token_ids.append(token_id)
+                else:
+                    print(f"[WARNING] Option '{option}' with token id '{token_id}' is a duplicate")
+        if len(options_token_ids) > len(set(options_token_ids)):
+            print("[WARNING] There are duplicate token ids for occupation options")
+        return options_token_ids
+
+    occupation_options_token_ids = create_occupation_token_ids(occupation_options)
+    occupation_options_token_ids_male = create_occupation_token_ids(occupation_options_male)
+    occupation_options_token_ids_female = create_occupation_token_ids(occupation_options_female)
 
     male_encodings = tokenizer(replaced_male, truncation=True, padding=True)
     female_encodings = tokenizer(replaced_female, truncation=True, padding=True)
@@ -195,8 +242,7 @@ def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False
     mask_token_index_male = [enc.index(tokenizer.mask_token_id) for enc in male_encodings["input_ids"]]
     mask_token_index_female = [enc.index(tokenizer.mask_token_id) for enc in female_encodings["input_ids"]]
     
-    dataset = Dataset.from_dict(
-        {
+    dataset_dict = {
             "input_ids_male": male_encodings["input_ids"],
             "input_ids_female": female_encodings["input_ids"],
             "attention_mask_male": male_encodings["attention_mask"],
@@ -204,10 +250,52 @@ def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False
             "token_type_ids_male": male_encodings["token_type_ids"],
             "token_type_ids_female": female_encodings["token_type_ids"],
             "output_indices": len(replaced_female) * [occupation_options_token_ids],
+            "output_indices_male": len(replaced_male) * [occupation_options_token_ids_male],
+            "output_indices_female": len(replaced_female) * [occupation_options_token_ids_female],
             "mask_token_idx_male": mask_token_index_male,
             "mask_token_idx_female": mask_token_index_female,
         }
-    )
+    
+
+    # If a model is given as parameter, we'll also return the initial logits and hidden states corresponding to
+    # the mask token, obtained using that model.
+    # The model should be BERT (without any additional prompts)
+    if model is not None:
+        male_inputs = tokenizer(replaced_male, truncation=True, padding=True, return_tensors="pt")
+        female_inputs = tokenizer(replaced_female, truncation=True, padding=True, return_tensors="pt")
+        male_mask_idx = torch.tensor(mask_token_index_male).to(model.device) 
+        female_mask_idx = torch.tensor(mask_token_index_female).to(model.device) 
+
+        is_training = model.training
+        if is_training:
+            model.eval()
+
+        with torch.no_grad():
+            male_outputs = model(**male_inputs, output_hidden_states=True)
+            female_outputs = model(**female_inputs, output_hidden_states=True)
+            male_logits = male_outputs.logits
+            female_logits = female_outputs.logits
+
+            if male_logits.size(1) != male_inputs["input_ids"].size(1):
+                raise ValueError("Only models without prompts are supported here")
+
+            male_mask_logits = male_logits[torch.arange(male_logits.size(0)), male_mask_idx,:]
+            female_mask_logits = female_logits[torch.arange(female_logits.size(0)), female_mask_idx,:]
+
+            male_hidden = male_outputs.hidden_states[-1]
+            female_hidden = female_outputs.hidden_states[-1]
+            male_mask_hidden = male_hidden[torch.arange(male_hidden.size(0)), male_mask_idx,:]
+            female_mask_hidden = female_hidden[torch.arange(female_hidden.size(0)), female_mask_idx,:]
+
+            dataset_dict["male_original_model_mask_logits"] = male_mask_logits.detach().cpu().tolist()
+            dataset_dict["female_original_model_mask_logits"] = female_mask_logits.detach().cpu().tolist()
+            dataset_dict["male_original_model_mask_hidden"] = male_mask_hidden.detach().cpu().tolist()
+            dataset_dict["female_original_model_mask_hidden"] = female_mask_hidden.detach().cpu().tolist()
+        
+        if is_training:
+            model.train()
+    
+    dataset = Dataset.from_dict(dataset_dict)
 
     if return_unencoded_sentences:
         return dataset, replaced_male, replaced_female
