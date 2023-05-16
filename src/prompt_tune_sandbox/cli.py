@@ -91,19 +91,21 @@ def loss_mean_valid_options_original_probabilities(male_mask_logits, female_mask
         invalid_options_log_probs = torch.log(1-torch.exp(torch.logsumexp(log_probs_valid_options, dim=1, keepdim=True)))  # [batch_size, 1]
         return torch.cat((log_probs_valid_options, invalid_options_log_probs), dim=1)
 
-    average_log_probabilities_valid_options = fix_probability_distribution(average_log_probabilities_valid_options)
-
     if specific_output_indices_male is not None and specific_output_indices_female is not None:
         output_indices_male = torch.cat((output_indices, specific_output_indices_male), dim=1)
         output_indices_female = torch.cat((output_indices, specific_output_indices_female), dim=1)
         log_probabilities_male_options = torch.gather(average_log_probabilities, 1, specific_output_indices_male)
         log_probabilities_female_options = torch.gather(average_log_probabilities, 1, specific_output_indices_female)
-        average_log_probabilities_gender_specific_options = torch.logaddexp(log_probabilities_male_options, log_probabilities_female_options)
+        # TODO: check if this really makes sense
+        average_log_probabilities_gender_specific_options = torch.logaddexp(log_probabilities_male_options, log_probabilities_female_options) # - torch.log(torch.tensor(2)) 
         average_log_probabilities_valid_options = torch.cat(
             (average_log_probabilities_valid_options, average_log_probabilities_gender_specific_options), dim=1)
     else:
         output_indices_male = output_indices
         output_indices_female = output_indices
+
+    # Make sure this adjustment is done AFTER the gender specific probabilities are appended to the input
+    average_log_probabilities_valid_options = fix_probability_distribution(average_log_probabilities_valid_options)
     
     male_mask_log_probabilities = torch.nn.functional.log_softmax(male_mask_logits, dim=1)
     male_mask_valid_options_log_prob = torch.gather(male_mask_log_probabilities, 1, output_indices_male)
@@ -164,76 +166,92 @@ def train_model(
         model.print_trainable_parameters()
 
     NUM_EPOCHS = num_epochs
-    train_loader = DataLoader(occupation_dataset, batch_size=16, shuffle=True)
-    optim = AdamW(model.parameters(), lr=2e-2)
+    dataset_split = occupation_dataset.train_test_split(test_size=0.1)
+    
+    train_loader = DataLoader(dataset_split["train"], batch_size=16, shuffle=True)
+    test_loader = DataLoader(dataset_split["test"], batch_size=16)
+    optim = AdamW(model.parameters(), lr=1e-2)
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optim,
         num_warmup_steps=0.06 * (len(train_loader) * NUM_EPOCHS),
         num_training_steps=(len(train_loader) * NUM_EPOCHS),
     )
 
+    def compute_loss(batch):
+        input_ids_male = batch["input_ids_male"].to(device)
+        input_ids_female = batch["input_ids_female"].to(device)
+        attention_mask_male = batch["attention_mask_male"].to(device)
+        attention_mask_female = batch["attention_mask_female"].to(device)
+        output_indices = batch["output_indices"].to(device)
+        mask_token_index_male = batch["mask_token_idx_male"].to(device)
+        mask_token_index_female = batch["mask_token_idx_female"].to(device)
+        male_original_model_mask_logits = batch["male_original_model_mask_logits"].to(device)
+        female_original_model_mask_logits = batch["female_original_model_mask_logits"].to(device)
+
+        if gender_specific_options:
+            output_indices_male = batch["output_indices_male"].to(device)
+            output_indices_female = batch["output_indices_female"].to(device)
+        else:
+            output_indices_male = None
+            output_indices_female = None
+
+        position_ids_male = create_positional_ids(input_ids_male.size(0), input_ids_male.size(1), prompt_length, device, position_ids_adjustment)
+        position_ids_female = create_positional_ids(input_ids_female.size(0), input_ids_female.size(1), prompt_length, device, position_ids_adjustment)
+
+        output_male = model(input_ids_male, attention_mask=attention_mask_male, position_ids=position_ids_male)
+        output_female = model(input_ids_female, attention_mask=attention_mask_female, position_ids=position_ids_female)
+        # size: torch.Size([batch, 27, 28996])
+        # shape i: [batch_size, seq_len, vocab_size]
+        # The model will also return the logits for the prompt tokens, so the output seq_len is larger than the input
+
+        # Adjust the mask token index and output indices to take into account the size of the prompt
+        mask_token_index_male = mask_token_index_male + prompt_length
+        mask_token_index_female = mask_token_index_female + prompt_length
+
+        male_logits = output_male.logits
+        male_mask_logits = male_logits[torch.arange(male_logits.size(0)), mask_token_index_male,:]
+        female_logits = output_female.logits
+        female_mask_logits = female_logits[torch.arange(female_logits.size(0)), mask_token_index_female,:]
+        # Shape is [batch_size, vocab_size]
+
+        # Compute loss
+        loss = None
+        if loss_type == LossFunctionType.equal_valid_options_mask_logits:
+            loss = loss_equal_valid_options_mask_logits(male_mask_logits, female_mask_logits, output_indices)
+        elif loss_type == LossFunctionType.mean_valid_options_original_probabilities:
+            loss = loss_mean_valid_options_original_probabilities(
+                male_mask_logits, female_mask_logits,
+                male_original_model_mask_logits, female_original_model_mask_logits,
+                output_indices, output_indices_male, output_indices_female)
+
+        if loss is None:
+            raise RuntimeError("Loss was not computed")
+        return loss
+
+
     console.rule("START OF TRAINING")
 
     for epoch in rich_track(range(1,NUM_EPOCHS+1), description="Training...", console=console):
         losses_in_batch = []
+        test_losses_in_batch = []
         for batch in train_loader:
             optim.zero_grad()
-            input_ids_male = batch["input_ids_male"].to(device)
-            input_ids_female = batch["input_ids_female"].to(device)
-            attention_mask_male = batch["attention_mask_male"].to(device)
-            attention_mask_female = batch["attention_mask_female"].to(device)
-            output_indices = batch["output_indices"].to(device)
-            mask_token_index_male = batch["mask_token_idx_male"].to(device)
-            mask_token_index_female = batch["mask_token_idx_female"].to(device)
-            male_original_model_mask_logits = batch["male_original_model_mask_logits"].to(device)
-            female_original_model_mask_logits = batch["female_original_model_mask_logits"].to(device)
-
-            if gender_specific_options:
-                output_indices_male = batch["output_indices_male"].to(device)
-                output_indices_female = batch["output_indices_female"].to(device)
-            else:
-                output_indices_male = None
-                output_indices_female = None
-
-            position_ids_male = create_positional_ids(input_ids_male.size(0), input_ids_male.size(1), prompt_length, device, position_ids_adjustment)
-            position_ids_female = create_positional_ids(input_ids_female.size(0), input_ids_female.size(1), prompt_length, device, position_ids_adjustment)
-
-            output_male = model(input_ids_male, attention_mask=attention_mask_male, position_ids=position_ids_male)
-            output_female = model(input_ids_female, attention_mask=attention_mask_female, position_ids=position_ids_female)
-            # size: torch.Size([batch, 27, 28996])
-            # shape i: [batch_size, seq_len, vocab_size]
-            # The model will also return the logits for the prompt tokens, so the output seq_len is larger than the input
-
-            # Adjust the mask token index and output indices to take into account the size of the prompt
-            mask_token_index_male = mask_token_index_male + prompt_length
-            mask_token_index_female = mask_token_index_female + prompt_length
-
-            male_logits = output_male.logits
-            male_mask_logits = male_logits[torch.arange(male_logits.size(0)), mask_token_index_male,:]
-            female_logits = output_female.logits
-            female_mask_logits = female_logits[torch.arange(female_logits.size(0)), mask_token_index_female,:]
-            # Shape is [batch_size, vocab_size]
-
-            # Compute loss
-            loss = None
-            if loss_type == LossFunctionType.equal_valid_options_mask_logits:
-                loss = loss_equal_valid_options_mask_logits(male_mask_logits, female_mask_logits, output_indices)
-            elif loss_type == LossFunctionType.mean_valid_options_original_probabilities:
-                loss = loss_mean_valid_options_original_probabilities(
-                    male_mask_logits, female_mask_logits,
-                    male_original_model_mask_logits, female_original_model_mask_logits,
-                    output_indices, output_indices_male, output_indices_female)
-
-            if loss is None:
-                raise RuntimeError("Loss was not computed")
-
+            loss = compute_loss(batch)
             losses_in_batch.append(loss.item())
-
             loss.backward()
 
             optim.step()
             lr_scheduler.step()
+        with torch.no_grad():
+            model.eval()
+            for batch in test_loader:
+                loss_test = compute_loss(batch)
+                test_losses_in_batch.append(loss_test.item())
+            model.train()
+            
+
         writer.add_scalar("Loss/train", np.mean(losses_in_batch), epoch)
+        writer.add_scalar("Loss/test", np.mean(test_losses_in_batch), epoch)
 
         if epoch % 10 == 0:
             console.log(f"Loss in epoch {epoch}: {np.mean(losses_in_batch)}")
