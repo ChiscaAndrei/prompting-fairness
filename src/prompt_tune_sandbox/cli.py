@@ -94,10 +94,10 @@ def loss_mean_valid_options_original_probabilities(male_mask_logits, female_mask
     if specific_output_indices_male is not None and specific_output_indices_female is not None:
         output_indices_male = torch.cat((output_indices, specific_output_indices_male), dim=1)
         output_indices_female = torch.cat((output_indices, specific_output_indices_female), dim=1)
-        log_probabilities_male_options = torch.gather(average_log_probabilities, 1, specific_output_indices_male)
-        log_probabilities_female_options = torch.gather(average_log_probabilities, 1, specific_output_indices_female)
+        log_probabilities_male_options = torch.gather(male_original_log_probabilities, 1, specific_output_indices_male)
+        log_probabilities_female_options = torch.gather(female_original_log_probabilities, 1, specific_output_indices_female)
         # TODO: check if this really makes sense
-        average_log_probabilities_gender_specific_options = torch.logaddexp(log_probabilities_male_options, log_probabilities_female_options) # - torch.log(torch.tensor(2)) 
+        average_log_probabilities_gender_specific_options = torch.logaddexp(log_probabilities_male_options, log_probabilities_female_options) - torch.log(torch.tensor(2)) 
         average_log_probabilities_valid_options = torch.cat(
             (average_log_probabilities_valid_options, average_log_probabilities_gender_specific_options), dim=1)
     else:
