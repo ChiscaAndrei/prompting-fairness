@@ -2,6 +2,7 @@ import json
 import os
 import torch
 import numpy as np
+from scipy.spatial import distance
 from src.bookcorpus.seat_utils import run_test
 from src.prompt_tune_sandbox.bias_template import prepare_dataset_for_masked_model
 from src.prompt_tune_sandbox.bias_template import create_positional_ids, PositionIdAdjustmentType
@@ -24,8 +25,10 @@ class BiasEvaluatorForBert:
             with open(file_path, "r") as json_file:
                 self.seat_templates[name] = json.load(json_file)
 
+    def evaluate(self, model, tokenizer, prompt_length=0, return_embeddings=True, position_id_adjustment=PositionIdAdjustmentType.none, return_words_close_to_prompts=False):
+        if return_words_close_to_prompts:
+            self.find_k_closest_words(model,tokenizer)
 
-    def evaluate(self, model, tokenizer, prompt_length=0, return_embeddings=True, position_id_adjustment = PositionIdAdjustmentType.none):
         seat_results = {}
         seat_embeddings = {}
         for seat_test_name, seat_template in self.seat_templates.items():
@@ -41,6 +44,9 @@ class BiasEvaluatorForBert:
 
         if return_embeddings:
             return_value["seat_embeddings"] = seat_embeddings
+        
+        if return_words_close_to_prompts:
+            return_value["closest_k_words"] = ("prompt_words_list", self.find_k_closest_words(model, tokenizer))
 
         return return_value
 
@@ -82,7 +88,7 @@ class BiasEvaluatorForBert:
 
         effect_size, p_value = run_test(x=targ1_embeddings, y=targ2_embeddings,
                                     a=attr1_embeddings, b=attr2_embeddings,
-                                    n_samples=10000, parametric=False)
+                                    n_samples=4000, parametric=True)
         p_value = p_value if effect_size > 0.0 else 1.0-p_value
 
         seat_result = {
@@ -159,5 +165,21 @@ class BiasEvaluatorForBert:
             "ratio_predictions_in_valid_options_male": float(number_predictions_in_valid_options_male)/batch_size,
             "ratio_predictions_in_valid_options_female": float(number_predictions_in_valid_options_female)/batch_size,
         }
+
+    @torch.no_grad()
+    def find_k_closest_words(self, model, tokenizer, k=5):
+        word_embeddings : torch.nn.Embedding = model.bert.embeddings.word_embeddings
+        embedding_values = word_embeddings.weight.detach().cpu().numpy()
+        # shape: [vocab_size, hidden_size]
+        prompt_embeddings = model.get_prompt_embedding_to_save().numpy()
+        # shape: [prompt_length, hidden_size]
+        closest_k_words_list = []
+        for prompt_element in prompt_embeddings:
+            dists = distance.cdist(np.expand_dims(prompt_element,0), embedding_values, 'cosine')[0]
+            # shape: [vocab_size]
+            closest_k_indices = np.argpartition(dists, list(range(k)))[:k]
+            closest_k_words = tokenizer.convert_ids_to_tokens(closest_k_indices)
+            closest_k_words_list.append(closest_k_words)
+        return closest_k_words_list
         
 

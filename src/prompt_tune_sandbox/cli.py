@@ -30,6 +30,17 @@ def add_results_to_tensorboard(writer: SummaryWriter, results, epoch, prefix="")
         data_type, data = results
         if data_type == "embedding":
             writer.add_embedding(**data, global_step=epoch, tag=prefix)
+        elif data_type == "prompt_words_list":
+            # Format the data as a table
+            num_words = len(data[0])
+            header_line1 = "| *Prompt Token Id* |" + "".join([f" *Close word {i}* |" for i in range(num_words)])
+            header_line2 = "|"+ "".join(["------------|" for i in range(num_words+1)])
+            table_lines = []
+            for idx, data_row in enumerate(data):
+                row = f"|    {idx}    |" + "".join([f"  {word}  |" for word in data_row])
+                table_lines.append(row)
+            table_markdown = "\n".join([header_line1, header_line2] + table_lines)
+            writer.add_text(prefix, table_markdown, epoch)
         else:
             raise ValueError(f"Invalid data type: {data_type}")
     else:
@@ -258,7 +269,8 @@ def train_model(
         if epoch % eval_interval == 0:
             model.eval()
             evaluation = bias_evaluator.evaluate(
-                model, tokenizer, prompt_length=prompt_length, return_embeddings=True, position_id_adjustment=position_ids_adjustment)
+                model, tokenizer, prompt_length=prompt_length, return_embeddings=True,
+                position_id_adjustment=position_ids_adjustment, return_words_close_to_prompts=True)
             dump_predictions_on_training_dataset(model, tokenizer, 10, prompt_length, out_file_sents=f"./runs/{experiment_name}/predictions_after_{epoch}.html")
             model.train()
             #for test_category, results_for_category in evaluation.items():
