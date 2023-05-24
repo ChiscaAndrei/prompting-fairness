@@ -11,18 +11,19 @@ import typer
 import json
 import itertools
 from enum import Enum
-from rich.console import Console
 from rich.progress import track as rich_track
+from .console import console
+import sys
+import os
 
 from src.prompt_tune_sandbox.bias_template import prepare_dataset_for_masked_model, create_positional_ids,PositionIdAdjustmentType
 from src.prompt_tune_sandbox.bias_trainer import BiasTrainerMaskedModel
 from src.prompt_tune_sandbox.bias_evaluator import BiasEvaluatorForBert
 
 app = typer.Typer()
-console = Console()
 
 def add_results_to_tensorboard(writer: SummaryWriter, results, epoch, prefix=""):
-    if type(results) is dict:
+    if isinstance(results, dict):
         for k, v in results.items():
             new_prefix = f"{prefix}/{k}" if prefix else k
             add_results_to_tensorboard(writer, v, epoch, new_prefix)
@@ -130,6 +131,32 @@ def loss_mean_valid_options_original_probabilities(male_mask_logits, female_mask
     loss = loss_male + loss_female
     return loss
 
+def compute_summary_results(evaluation_initial, evaluation_final):
+    seat_initial: dict = evaluation_initial["seat_results"]
+    seat_final: dict = evaluation_final["seat_results"]
+
+    results = {}
+
+    differences_of_absolute_value = []
+    for test_name, test_results_initial in seat_initial.items(): 
+        if test_name in seat_final:
+            test_results_final = seat_final[test_name]
+            difference = abs(test_results_initial["effect_size"]) - abs(test_results_final["effect_size"])
+            differences_of_absolute_value.append(difference)
+    results["SeatMeanEffectDifference"] = np.mean(differences_of_absolute_value)
+
+    stereo_initial_gender = evaluation_initial["stereo_set"]["gender"]
+    stereo_final_gender = evaluation_final["stereo_set"]["gender"]
+
+    results["InitialStereoSetGenderLM"]   = stereo_initial_gender["LM Score"]
+    results["InitialStereoSetGenderICAT"] = stereo_initial_gender["ICAT Score"]
+    results["InitialStereoSetGenderSS"]   = stereo_initial_gender["SS Score"]
+    results["FinalStereoSetGenderLM"]   = stereo_final_gender["LM Score"]
+    results["FinalStereoSetGenderICAT"] = stereo_final_gender["ICAT Score"]
+    results["FinalStereoSetGenderSS"]   = stereo_final_gender["SS Score"]
+
+    return results
+
 @app.command()
 def train_model(
         model_name='bert-large-cased', 
@@ -145,6 +172,8 @@ def train_model(
     # Create tensorboard writer
     writer = SummaryWriter(log_dir=f"./runs/{experiment_name}")
     console.log(f"Writing tensorboard logs to {writer.log_dir}")
+    with open(f"{writer.log_dir}/experiment_command.sh", "w") as fout:
+        fout.write("python " + " ".join(sys.argv))
 
     with console.status(f"Loading model under bias investigation {model_name}..."):
         tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -161,7 +190,7 @@ def train_model(
     with console.status(f"Evaluating original model..."):
         bias_evaluator = BiasEvaluatorForBert()
         model.eval()
-        evaluation_initial_results = bias_evaluator.evaluate(model, tokenizer)
+        evaluation_initial_results = bias_evaluator.evaluate(model, tokenizer, return_stereo_set_results=True)
         add_results_to_tensorboard(writer, evaluation_initial_results, 0)
         dump_predictions_on_training_dataset(model, tokenizer, 10, 0, out_file_sents=f"./runs/{experiment_name}/predictions_before.html")
         console.log("Finished evaluation of initial model")
@@ -177,11 +206,14 @@ def train_model(
         model.print_trainable_parameters()
 
     NUM_EPOCHS = num_epochs
-    dataset_split = occupation_dataset.train_test_split(test_size=0.1)
+    LEARNING_RATE = 1e-2
+    VALID_DATASET_RATIO = 0.05
+    BATCH_SIZE = 16
+    dataset_split = occupation_dataset.train_test_split(test_size=VALID_DATASET_RATIO)
     
-    train_loader = DataLoader(dataset_split["train"], batch_size=16, shuffle=True)
-    test_loader = DataLoader(dataset_split["test"], batch_size=16)
-    optim = AdamW(model.parameters(), lr=1e-2)
+    train_loader = DataLoader(dataset_split["train"], batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(dataset_split["test"], batch_size=BATCH_SIZE)
+    optim = AdamW(model.parameters(), lr=LEARNING_RATE)
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optim,
         num_warmup_steps=0.06 * (len(train_loader) * NUM_EPOCHS),
@@ -270,12 +302,29 @@ def train_model(
             model.eval()
             evaluation = bias_evaluator.evaluate(
                 model, tokenizer, prompt_length=prompt_length, return_embeddings=True,
-                position_id_adjustment=position_ids_adjustment, return_words_close_to_prompts=True)
+                position_id_adjustment=position_ids_adjustment, return_words_close_to_prompts=True,
+                return_stereo_set_results=True)
             dump_predictions_on_training_dataset(model, tokenizer, 10, prompt_length, out_file_sents=f"./runs/{experiment_name}/predictions_after_{epoch}.html")
             model.train()
             #for test_category, results_for_category in evaluation.items():
             add_results_to_tensorboard(writer, evaluation, epoch)
     console.rule("FINISHED TRAINING")
+    writer.flush()
+    evaluation_final_results = evaluation
+    metric_dict = compute_summary_results(evaluation_initial_results, evaluation_final_results)
+    hparams_dict = {
+        "model_name": model_name,
+        "prompt_length": prompt_length,
+        "num_epochs": num_epochs,
+        "loss_type": loss_type,
+        "position_ids_adjustment": position_ids_adjustment,
+        "learning_rate": LEARNING_RATE,
+        "valid_set_ratio": VALID_DATASET_RATIO,
+        "batch_size": BATCH_SIZE,
+    }
+    writer.add_hparams(hparams_dict, metric_dict,
+            run_name=experiment_name)
+    writer.close()
 
 @app.command()
 def inspect_dataset(

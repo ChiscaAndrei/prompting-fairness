@@ -4,6 +4,7 @@ from enum import Enum
 import torch
 import os
 import json
+import logging as log
 
 # Types of tokens:
 # gendered_word : {he, she, name?}
@@ -291,14 +292,14 @@ def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False
         for option in options:
             token_id = tokenizer.convert_tokens_to_ids([option])[0]
             if token_id == tokenizer.unk_token_id:
-                print(f"[WARNING] Option '{option}' is not a valid token")
+                log.warning(f"Option '{option}' is not a valid token")
             else:
                 if token_id not in options_token_ids:
                     options_token_ids.append(token_id)
                 else:
-                    print(f"[WARNING] Option '{option}' with token id '{token_id}' is a duplicate")
+                    log.warning(f"Option '{option}' with token id '{token_id}' is a duplicate")
         if len(options_token_ids) > len(set(options_token_ids)):
-            print("[WARNING] There are duplicate token ids for occupation options")
+            log.warning("There are duplicate token ids for occupation options")
         return options_token_ids
 
     occupation_options_token_ids = create_occupation_token_ids(occupation_options)

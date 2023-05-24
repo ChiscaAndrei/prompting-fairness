@@ -211,12 +211,12 @@ def run_test(x, y, a, b, n_samples, parametric=False):
     AB = a.copy()
     AB.update(b)
 
-    typer.echo("Computing cosine similarities lookup...")
+    log.info("Computing cosine similarities lookup...")
     cossims = construct_cossim_lookup(XY, AB)
 
-    typer.echo("Computing pval...")
+    log.info("Computing pval...")
     pval = p_val_permutation_test(x, y, a, b, n_samples, cossims=cossims, parametric=parametric)
 
-    typer.echo("Computing effect size...")
+    log.info("Computing effect size...")
     esize = effect_size(x, y, a, b, cossims=cossims)
     return esize, pval

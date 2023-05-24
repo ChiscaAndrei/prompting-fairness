@@ -6,6 +6,9 @@ from scipy.spatial import distance
 from src.bookcorpus.seat_utils import run_test
 from src.prompt_tune_sandbox.bias_template import prepare_dataset_for_masked_model
 from src.prompt_tune_sandbox.bias_template import create_positional_ids, PositionIdAdjustmentType
+from src.prompt_tune_sandbox.stereoset_evaluator.stereoset import StereoSetRunner, ScoreEvaluator as StereoSetScoreEvaluator
+
+from .console import console
 
 class BiasEvaluatorForBert:
     
@@ -25,16 +28,25 @@ class BiasEvaluatorForBert:
             with open(file_path, "r") as json_file:
                 self.seat_templates[name] = json.load(json_file)
 
-    def evaluate(self, model, tokenizer, prompt_length=0, return_embeddings=True, position_id_adjustment=PositionIdAdjustmentType.none, return_words_close_to_prompts=False):
-        if return_words_close_to_prompts:
-            self.find_k_closest_words(model,tokenizer)
+    def evaluate(self, model, tokenizer,
+                 prompt_length=0, 
+                 return_embeddings=True, 
+                 position_id_adjustment=PositionIdAdjustmentType.none, 
+                 return_words_close_to_prompts=False, 
+                 return_stereo_set_results=False,
+                 stereoset_only_evaluate_gender=True,
+                 ):
 
+        console.log("[b]Starting evaluation...")
+
+        console.log("Evaluating SEAT...")
         seat_results = {}
         seat_embeddings = {}
         for seat_test_name, seat_template in self.seat_templates.items():
             seat_results[seat_test_name], seat_embeddings[seat_test_name] = self.evaluate_seat(
                 seat_template, model, tokenizer, prompt_length, position_id_adjustment)
         
+        console.log("Evaluating training dataset")
         occupation_dataset_statistics = self.evaluate_training_occupation_dataset(model, tokenizer, prompt_length, position_id_adjustment)
 
         return_value = {
@@ -46,7 +58,13 @@ class BiasEvaluatorForBert:
             return_value["seat_embeddings"] = seat_embeddings
         
         if return_words_close_to_prompts:
+            console.log("Finding k closest words...")
             return_value["closest_k_words"] = ("prompt_words_list", self.find_k_closest_words(model, tokenizer))
+
+        if return_stereo_set_results:
+            console.log("Evaluating stereoset")
+            return_value["stereo_set"] = self.evaluate_stereo_set(
+                model, tokenizer, prompt_length, only_evaluate_gender=stereoset_only_evaluate_gender, position_id_adjustment=position_id_adjustment)
 
         return return_value
 
@@ -181,5 +199,26 @@ class BiasEvaluatorForBert:
             closest_k_words = tokenizer.convert_ids_to_tokens(closest_k_indices)
             closest_k_words_list.append(closest_k_words)
         return closest_k_words_list
+    
+    @torch.no_grad()
+    def evaluate_stereo_set(self, model, tokenizer, prompt_length, only_evaluate_gender=True, position_id_adjustment=PositionIdAdjustmentType.none):
+        current_dir = os.path.dirname(__file__)
+        stereo_set_dataset_path = f"{current_dir}/stereoset_evaluator/data/stereoset/test.json"
+        bias_types = ["gender"] if only_evaluate_gender else None
+        runner = StereoSetRunner(
+            model,
+            tokenizer,
+            input_file=stereo_set_dataset_path,
+            batch_size=1,
+            max_seq_length=128,
+            prompt_tuning_prompt_length=prompt_length,
+            bias_types_to_load=bias_types,
+            prompt_tuning_positional_ids_type=position_id_adjustment,
+        )
+        predictions = runner()
+        console.log("   Computing stereoset score...")
+        score_evaluator = StereoSetScoreEvaluator(stereo_set_dataset_path, predictions=predictions, bias_types_to_load=bias_types)
+        return score_evaluator.get_overall_results()["intrasentence"]
+        
         
 
