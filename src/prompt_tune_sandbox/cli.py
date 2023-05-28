@@ -15,6 +15,7 @@ from rich.progress import track as rich_track
 from .console import console
 import sys
 import os
+from huggingface_hub import HfApi, hf_hub_download
 
 from src.prompt_tune_sandbox.bias_template import prepare_dataset_for_masked_model, create_positional_ids,PositionIdAdjustmentType
 from src.prompt_tune_sandbox.bias_trainer import BiasTrainerMaskedModel
@@ -167,6 +168,7 @@ def train_model(
         loss_type: LossFunctionType = LossFunctionType.equal_valid_options_mask_logits,
         position_ids_adjustment: PositionIdAdjustmentType = PositionIdAdjustmentType.none,
         gender_specific_options: bool = False,
+        hub_repo_prefix: str= None
         ):
 
     # Create tensorboard writer
@@ -301,7 +303,7 @@ def train_model(
         if epoch % eval_interval == 0:
             model.eval()
             evaluation = bias_evaluator.evaluate(
-                model, tokenizer, prompt_length=prompt_length, return_embeddings=True,
+                model, tokenizer, prompt_length=prompt_length, return_embeddings=False,
                 position_id_adjustment=position_ids_adjustment, return_words_close_to_prompts=True,
                 return_stereo_set_results=True)
             dump_predictions_on_training_dataset(model, tokenizer, 10, prompt_length, out_file_sents=f"./runs/{experiment_name}/predictions_after_{epoch}.html")
@@ -310,6 +312,7 @@ def train_model(
             add_results_to_tensorboard(writer, evaluation, epoch)
     console.rule("FINISHED TRAINING")
     writer.flush()
+    console.log("Performing final evaluation")
     evaluation_final_results = evaluation
     metric_dict = compute_summary_results(evaluation_initial_results, evaluation_final_results)
     hparams_dict = {
@@ -325,6 +328,25 @@ def train_model(
     writer.add_hparams(hparams_dict, metric_dict,
             run_name=experiment_name)
     writer.close()
+
+    # Save the evaluation_metrics and params to the results folder
+    with open(f"{writer.log_dir}/results.json", "w") as fout:
+        json.dump(metric_dict, fout, indent=4)
+    with open(f"{writer.log_dir}/params.json", "w") as fout:
+        json.dump(hparams_dict, fout, indent=4)
+
+    # Uploading model to hub:
+    if hub_repo_prefix is not None:
+        repo_id = hub_repo_prefix + experiment_name
+        with console.status(f"Uploading model to {repo_id}"):
+            model.push_to_hub(repo_id, private=True)
+            api = HfApi()
+            api.upload_folder(
+                folder_path=f"{writer.log_dir}",
+                repo_id=repo_id,
+                repo_type="model",
+                path_in_repo=f"training_eval_data/{experiment_name}"
+            )
 
 @app.command()
 def inspect_dataset(
@@ -453,6 +475,136 @@ def experiment_position_ids(
     console.print("\n[b]Start 3 results:[/b]", results_start_3)
     console.print("\n[b]Initial results (second try):[/b]", results_initial2)
 
+def compute_final_evaluation_results(evaluation, base_model_results=None):
+
+    results = {}
+    results["seat_results"] = evaluation["seat_results"]
+    results["stereo_set"] = evaluation["stereo_set"]
+
+    # If results for the base model are available, compute differences compared to the initial model
+    # Otherwise compute the difference of results with themselves (resulting in all 0 values)
+    # This is inefficient, but doing it this way makes it easier to compare results in tensorboard
+    if not base_model_results:
+        base_model_results = results
+    # SEAT
+    seat_differences = {}
+    seat_initial: dict = base_model_results["seat_results"]
+    seat_final: dict = results["seat_results"]
+    for test_name, test_results_initial in seat_initial.items(): 
+        if test_name in seat_final:
+            test_results_final = seat_final[test_name]
+            difference = abs(test_results_initial["effect_size"]) - abs(test_results_final["effect_size"])
+            seat_differences[test_name]= difference
+    average_difference = np.mean(list(seat_differences.values()))
+    seat_differences["average"] = average_difference
+    results["seat_differences"] = seat_differences
+    # StereoSet
+    stereo_set_differences = {}
+    stereo_set_initial = base_model_results["stereo_set"]
+    stereo_set_final = results["stereo_set"]
+    for bias_domain, test_results_initial in stereo_set_initial.items():
+        if bias_domain in stereo_set_final:
+            domain_differences = {}
+            for score in ["LM Score", "ICAT Score", "SS Score"]:
+                domain_differences[score] = stereo_set_initial[bias_domain][score] - stereo_set_final[bias_domain][score]
+            stereo_set_differences[bias_domain] = domain_differences
+    results["stereo_set_differences"] = stereo_set_differences
+
+    # Compute metrics dict for tensorboard
+    metrics_dict = pd.json_normalize(results, sep="_").to_dict(orient="records")[0]
+
+    return results, metrics_dict
+
+
+@app.command()
+def evaluate_model(
+    hub_model_id: str,
+    hub_results_repo_id: str,
+    eval_base_model: bool = False,
+):
+    model_name = hub_model_id.split('/')[-1]
+    log_dir_path = f"./runs_eval/eval_{model_name}"
+    if os.path.isdir(log_dir_path):
+        raise ValueError(f"Directory '{log_dir_path}' already exists.")
+    writer = SummaryWriter(log_dir=log_dir_path)
+    console.log(f"Writing tensorboard logs to {writer.log_dir}")
+    with open(f"{writer.log_dir}/eval_command.sh", "w") as fout:
+        fout.write("python " + " ".join(sys.argv))
+
+    if not eval_base_model:
+        with console.status("Loading config for PEFT model"):
+            config  = peft.PromptTuningConfig.from_pretrained(hub_model_id)
+            if config.peft_type != "PROMPT_TUNING":
+                raise ValueError("Only prompt tuning models are currently supported for evaluation")
+            params_file_path = hf_hub_download(hub_model_id, "params.json", subfolder=f"training_eval_data/{model_name}")
+            with open(params_file_path, "r") as params_file:
+                params = json.load(params_file)
+    else:
+        params = {
+            "model_name": model_name,
+            "prompt_length": 0,
+            "num_epochs": 0,
+            "loss_type": "none",
+            "position_ids_adjustment": PositionIdAdjustmentType.none,
+            "learning_rate": 0,
+            "valid_set_ratio": 0,
+            "batch_size": 0,
+        }
+
+    base_model_name = config.base_model_name_or_path.split('/')[-1] if not eval_base_model else model_name
+    base_model_path = config.base_model_name_or_path if not eval_base_model else hub_model_id
+
+    base_model_results = None
+    if not eval_base_model:
+        console.log(f"Downloading results for base model: {base_model_name} ...") 
+        initial_results_path = hf_hub_download(hub_results_repo_id, "eval_results.json", subfolder=base_model_name)
+        with open(initial_results_path, "r") as initial_results_file:
+            base_model_results = json.load(initial_results_file)
+
+    with console.status(f"Loading base model: {base_model_path}"):
+        model = AutoModelForMaskedLM.from_pretrained(base_model_path)
+        tokenizer = AutoTokenizer.from_pretrained(base_model_path)
+
+    if not eval_base_model:
+        with console.status("Converting to PEFT model"):
+            model = peft.PeftModel.from_pretrained(model, hub_model_id)
+
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    model=model.to(device)
+
+    prompt_length = config.num_virtual_tokens if not eval_base_model else 0
+
+    position_ids_adjustment = PositionIdAdjustmentType(params["position_ids_adjustment"]) if not eval_base_model else PositionIdAdjustmentType.none
+    console.log(f"Model uses prompt length {prompt_length} and position ids adjustment '{position_ids_adjustment}'")
+
+    # Evaluate the model
+    bias_evaluator = BiasEvaluatorForBert()
+    with console.status("Evaluating model..."):
+        evaluation = bias_evaluator.evaluate(
+            model, tokenizer, prompt_length=prompt_length, return_embeddings=False,
+            position_id_adjustment=position_ids_adjustment, return_words_close_to_prompts=False,
+            return_stereo_set_results=True,
+            stereoset_only_evaluate_gender=False)
+
+    results, metrics_dict = compute_final_evaluation_results(evaluation, base_model_results=base_model_results)
+    console.print(results)
+    console.print(metrics_dict)
+
+    # Add results to tensorboard
+    writer.add_hparams(params, metrics_dict, run_name=model_name)
+    writer.close()
+    # Write the results as json file
+    with open(os.path.join(log_dir_path, "eval_results.json"), "w") as fout:
+        json.dump(results, fout, indent=4)
+    # Upload eval folder to hub
+    console.log(f"Uploading results to {hub_results_repo_id} ...")
+    api = HfApi()
+    api.upload_folder(
+        folder_path=log_dir_path,
+        repo_id=hub_results_repo_id,
+        repo_type="model",
+        path_in_repo=model_name
+    )
 
 
 if __name__ == '__main__':

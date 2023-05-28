@@ -239,8 +239,8 @@ def create_positional_ids(batch_size, sequence_size, prompt_size, device, adjust
         return None
     elif adjustment_method == PositionIdAdjustmentType.cls_first:
         position_ids = torch.zeros((batch_size, prompt_size+sequence_size), dtype=torch.long)
-        position_ids[:,:prompt_size] = torch.arange(prompt_size)
-        position_ids[:,prompt_size+1:] = torch.arange(prompt_size, prompt_size+sequence_size-1)
+        position_ids[:,:prompt_size] = torch.arange(1, prompt_size+1)
+        position_ids[:,prompt_size+1:] = torch.arange(prompt_size+1, prompt_size+sequence_size)
         # position_ids [:,prompt_size], which corresponds to the CLS token, will remain 0
         return position_ids.to(device)
     elif adjustment_method in offset_vals.keys():

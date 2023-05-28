@@ -125,5 +125,9 @@ venv.bak/
 .dmypy.json
 dmypy.json
 
+runs/
+runs_eval/
+runs*/
+
 # Pyre type checker
 .pyre/
