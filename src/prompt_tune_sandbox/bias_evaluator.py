@@ -2,11 +2,13 @@ import json
 import os
 import torch
 import numpy as np
+import spacy
 from scipy.spatial import distance
 from src.bookcorpus.seat_utils import run_test
 from src.prompt_tune_sandbox.bias_template import prepare_dataset_for_masked_model
 from src.prompt_tune_sandbox.bias_template import create_positional_ids, PositionIdAdjustmentType
 from src.prompt_tune_sandbox.stereoset_evaluator.stereoset import StereoSetRunner, ScoreEvaluator as StereoSetScoreEvaluator
+from datasets import load_dataset
 
 from .console import console
 
@@ -28,6 +30,7 @@ class BiasEvaluatorForBert:
             with open(file_path, "r") as json_file:
                 self.seat_templates[name] = json.load(json_file)
 
+    @torch.inference_mode()
     def evaluate(self, model, tokenizer,
                  prompt_length=0, 
                  return_embeddings=True, 
@@ -35,6 +38,7 @@ class BiasEvaluatorForBert:
                  return_words_close_to_prompts=False, 
                  return_stereo_set_results=False,
                  stereoset_only_evaluate_gender=True,
+                 return_perplexity=False,
                  ):
 
         console.log("[b]Starting evaluation...")
@@ -56,13 +60,17 @@ class BiasEvaluatorForBert:
 
         if return_embeddings:
             return_value["seat_embeddings"] = seat_embeddings
+
+        if return_perplexity:
+            console.log("Evaluating perplexity...")
+            return_value["perplexity"] = self.evaluate_perplexity(model, tokenizer, prompt_length, position_id_adjustment)
         
         if return_words_close_to_prompts:
             console.log("Finding k closest words...")
             return_value["closest_k_words"] = ("prompt_words_list", self.find_k_closest_words(model, tokenizer))
 
         if return_stereo_set_results:
-            console.log("Evaluating stereoset")
+            console.log("Evaluating stereoset...")
             return_value["stereo_set"] = self.evaluate_stereo_set(
                 model, tokenizer, prompt_length, only_evaluate_gender=stereoset_only_evaluate_gender, position_id_adjustment=position_id_adjustment)
 
@@ -75,6 +83,7 @@ class BiasEvaluatorForBert:
                tokenizer,
                prompt_length,
                position_id_adjustment=PositionIdAdjustmentType.none,
+               use_cls_only=False,
                ):
         tokens = tokenizer(text, return_tensors='pt').to(model.device)
         batch_size = tokens["input_ids"].size(0)
@@ -84,9 +93,18 @@ class BiasEvaluatorForBert:
 
         # hidden_states [batch, seq_len, d_hidden]
         hidden_states = outputs.hidden_states[-1]
+        if use_cls_only:
+            # Only use the embedding corresponding to the CLS token
+            return hidden_states[:, prompt_length, :].squeeze().detach().cpu().numpy()
+        else:
+            # Average over the last layer's hidden representations and normalize the vector
+            # (same as in github.com/McGill-NLP/bias-bench/blob/main/bias_bench/benchmark/seat/seat.py)
+            # Only tokens which are not part of the prompt are taken into account
+            encoding = hidden_states[:, prompt_length:, :].mean(dim=1).squeeze().detach().cpu().numpy()
+            encoding /= np.linalg.norm(encoding)
+            return encoding
 
-        return hidden_states[:, prompt_length, :].squeeze().detach().cpu().numpy()
-
+    @torch.inference_mode()
     def evaluate_seat(self, seat_template, model, tokenizer, prompt_length, position_id_adjustment=PositionIdAdjustmentType.none):
         with torch.no_grad():
             targ1_embeddings = np.array(
@@ -219,6 +237,85 @@ class BiasEvaluatorForBert:
         console.log("   Computing stereoset score...")
         score_evaluator = StereoSetScoreEvaluator(stereo_set_dataset_path, predictions=predictions, bias_types_to_load=bias_types)
         return score_evaluator.get_overall_results()["intrasentence"]
+
+    @torch.inference_mode()
+    def evaluate_perplexity(self, model, tokenizer, prompt_length, position_id_adjustment=PositionIdAdjustmentType.none, sentencize=True):
+        # Load the dataset
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        if sentencize:
+            # Create a pipeline which divides the text into sentences
+            nlp = spacy.load("en_core_web_md")
+            nlp.disable_pipes("tok2vec", "tagger", "parser", "attribute_ruler", "lemmatizer")
+            nlp.add_pipe('sentencizer')
+
+        n_elements_total = len(dataset["text"])
+        n_elements_processed = 0
+        n_elements_since_last_update = 0
+        total_score = 0
+        total_n_tokens = 0
+        for text in dataset["text"][:n_elements_total]:
+            n_elements_processed += 1
+            n_elements_since_last_update += 1
+            if n_elements_since_last_update >= 0.05 * n_elements_total:
+                n_elements_since_last_update = 0
+                console.log(
+                    f"    [Perplexity] Processed {int(100*(n_elements_processed/n_elements_total))}% of dataset. Total score: {total_score}. Total tokens: {total_n_tokens}. Perplexity:{np.exp(total_score / total_n_tokens)}")
+            if not text:
+                # skip empty strings
+                continue
+            if sentencize:
+                doc = nlp(text)
+                sentences = doc.sents
+            else:
+                sentences = [text]
+            for sentence in sentences:
+                text_input = sentence.text if sentencize else sentence
+                if not text_input:
+                    continue
+                try:
+                    score, n_tokens = self.pseudo_perplexity_score(text_input, model, tokenizer,
+                                                                prompt_length=prompt_length, position_id_adjustment=position_id_adjustment)
+                    if not n_tokens:
+                        continue
+                    # console.log(f"Score: {score}     NTokens:{n_tokens}")
+                    total_score += score
+                    total_n_tokens += n_tokens
+                except Exception as e:
+                    console.log(f"[ERROR] Message:{str(e)}\nSentence: {text_input}")
+                    
+        pseudo_perplexity = np.exp(total_score / total_n_tokens)
+        return pseudo_perplexity
+
+    def pseudo_perplexity_score(self, sentence, model, tokenizer, prompt_length=0, position_id_adjustment=PositionIdAdjustmentType.none):
+        input_ids = tokenizer.encode(sentence, return_tensors="pt").to(model.device)
+        nr_nonspecial_tokens = input_ids.size(-1) - 2  # ignore [CLS] and [SEP]
+        if nr_nonspecial_tokens <= 0:
+            return 0, 0
+        # mask each not-special token one by one, in a separate sentence
+        input_ids_batch = input_ids.repeat(nr_nonspecial_tokens, 1)
+        position_ids = create_positional_ids(input_ids_batch.size(0), input_ids_batch.size(1), prompt_length, model.device, position_id_adjustment)
+        labels = torch.full((input_ids_batch.size(0), input_ids_batch.size(1)+prompt_length), -100).to(model.device)  # positions with value -100 are ignored
+        labels[:,1+prompt_length:-1][torch.eye(nr_nonspecial_tokens).bool()] = input_ids_batch[:,1:-1].diagonal()
+        input_ids_batch[:,1:-1].fill_diagonal_(tokenizer.mask_token_id)
+
+        total_loss = 0.0
+        # Divide the batch into smaller batches to avoid out of memory exceptions
+        max_minibatch_size = 32
+        for start_idx in range(0, nr_nonspecial_tokens, max_minibatch_size):
+            input_ids_minibatch = input_ids_batch[start_idx:start_idx+max_minibatch_size,:]
+            labels_minibatch = labels[start_idx:start_idx+max_minibatch_size,:]
+            position_ids_minibatch = position_ids[start_idx:start_idx+max_minibatch_size,:] if position_ids is not None else None
+            n_elements_minibatch = input_ids_minibatch.size(0)
+
+            output = model(input_ids_minibatch, labels=labels_minibatch, position_ids=position_ids_minibatch)
+            # The BERT loss function uses 'mean' reduction by default,
+            # so we have to multiply by the nr of masks in the minibatch
+            total_loss += n_elements_minibatch * output.loss.item()
+        return total_loss, nr_nonspecial_tokens
+
+
+
+
         
         
 

@@ -480,6 +480,7 @@ def compute_final_evaluation_results(evaluation, base_model_results=None):
     results = {}
     results["seat_results"] = evaluation["seat_results"]
     results["stereo_set"] = evaluation["stereo_set"]
+    results["perplexity"] = evaluation["perplexity"]
 
     # If results for the base model are available, compute differences compared to the initial model
     # Otherwise compute the difference of results with themselves (resulting in all 0 values)
@@ -509,6 +510,8 @@ def compute_final_evaluation_results(evaluation, base_model_results=None):
                 domain_differences[score] = stereo_set_initial[bias_domain][score] - stereo_set_final[bias_domain][score]
             stereo_set_differences[bias_domain] = domain_differences
     results["stereo_set_differences"] = stereo_set_differences
+    # Perplexity
+    results["perplexity_difference"] = base_model_results["perplexity"] - results["perplexity"]
 
     # Compute metrics dict for tensorboard
     metrics_dict = pd.json_normalize(results, sep="_").to_dict(orient="records")[0]
@@ -521,6 +524,7 @@ def evaluate_model(
     hub_model_id: str,
     hub_results_repo_id: str,
     eval_base_model: bool = False,
+    upload_to_hub: bool = True,
 ):
     model_name = hub_model_id.split('/')[-1]
     log_dir_path = f"./runs_eval/eval_{model_name}"
@@ -571,6 +575,7 @@ def evaluate_model(
 
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model=model.to(device)
+    model.eval()
 
     prompt_length = config.num_virtual_tokens if not eval_base_model else 0
 
@@ -584,7 +589,8 @@ def evaluate_model(
             model, tokenizer, prompt_length=prompt_length, return_embeddings=False,
             position_id_adjustment=position_ids_adjustment, return_words_close_to_prompts=False,
             return_stereo_set_results=True,
-            stereoset_only_evaluate_gender=False)
+            stereoset_only_evaluate_gender=False,
+            return_perplexity=True)
 
     results, metrics_dict = compute_final_evaluation_results(evaluation, base_model_results=base_model_results)
     console.print(results)
@@ -597,14 +603,15 @@ def evaluate_model(
     with open(os.path.join(log_dir_path, "eval_results.json"), "w") as fout:
         json.dump(results, fout, indent=4)
     # Upload eval folder to hub
-    console.log(f"Uploading results to {hub_results_repo_id} ...")
-    api = HfApi()
-    api.upload_folder(
-        folder_path=log_dir_path,
-        repo_id=hub_results_repo_id,
-        repo_type="model",
-        path_in_repo=model_name
-    )
+    if upload_to_hub:
+        console.log(f"Uploading results to {hub_results_repo_id} ...")
+        api = HfApi()
+        api.upload_folder(
+            folder_path=log_dir_path,
+            repo_id=hub_results_repo_id,
+            repo_type="model",
+            path_in_repo=model_name
+        )
 
 
 if __name__ == '__main__':
