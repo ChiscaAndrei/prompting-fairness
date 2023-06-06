@@ -35,6 +35,8 @@ class BiasEvaluatorForBert:
                  prompt_length=0, 
                  return_embeddings=True, 
                  position_id_adjustment=PositionIdAdjustmentType.none, 
+                 return_seat_results=True,
+                 return_occupation_dataset_results=True,
                  return_words_close_to_prompts=False, 
                  return_stereo_set_results=False,
                  stereoset_only_evaluate_gender=True,
@@ -42,24 +44,23 @@ class BiasEvaluatorForBert:
                  ):
 
         console.log("[b]Starting evaluation...")
+        return_value = {}
 
-        console.log("Evaluating SEAT...")
-        seat_results = {}
-        seat_embeddings = {}
-        for seat_test_name, seat_template in self.seat_templates.items():
-            seat_results[seat_test_name], seat_embeddings[seat_test_name] = self.evaluate_seat(
-                seat_template, model, tokenizer, prompt_length, position_id_adjustment)
+        if return_seat_results:
+            console.log("Evaluating SEAT...")
+            seat_results = {}
+            seat_embeddings = {}
+            for seat_test_name, seat_template in self.seat_templates.items():
+                seat_results[seat_test_name], seat_embeddings[seat_test_name] = self.evaluate_seat(
+                    seat_template, model, tokenizer, prompt_length, position_id_adjustment)
+            return_value["seat_results"] = seat_results
+            if return_embeddings:
+                return_value["seat_embeddings"] = seat_embeddings
         
-        console.log("Evaluating training dataset")
-        occupation_dataset_statistics = self.evaluate_training_occupation_dataset(model, tokenizer, prompt_length, position_id_adjustment)
-
-        return_value = {
-            "seat_results": seat_results,
-            "occupation_dataset": occupation_dataset_statistics,
-        }
-
-        if return_embeddings:
-            return_value["seat_embeddings"] = seat_embeddings
+        if return_occupation_dataset_results:
+            console.log("Evaluating training dataset")
+            occupation_dataset_statistics = self.evaluate_training_occupation_dataset(model, tokenizer, prompt_length, position_id_adjustment)
+            return_value["occupation_dataset"] = occupation_dataset_statistics
 
         if return_perplexity:
             console.log("Evaluating perplexity...")

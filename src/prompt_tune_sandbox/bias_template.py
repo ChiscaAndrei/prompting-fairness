@@ -1,6 +1,7 @@
 from string import Template
 from datasets import Dataset
 from enum import Enum
+from collections import deque
 import torch
 import os
 import json
@@ -249,8 +250,70 @@ def create_positional_ids(batch_size, sequence_size, prompt_size, device, adjust
         position_ids[:,:] = torch.arange(offset, prompt_size+sequence_size+offset)
         return position_ids.to(device)
 
+def _create_templates_with_names(templates, tokenizer):
+    # Only use templates in which at least a slot can be replaced by a name 
+    used_templates = [t for t in templates if "${gendered_word}" in t.template]
+    male_names = [
+        "Robert",
+        "Michael",
+        "William",
+        "Richard",
+        "Daniel",
+        "Andrew",
+        "George",
+        "Brian",
+        "Ryan",
+        "Stephen",
+    ]
+    female_names = [
+        "Patricia",
+        "Jennifer",
+        "Barbara",
+        "Susan",
+        "Jessica",
+        "Karen",
+        "Emily",
+        "Rebecca",
+        "Cynthia",
+        "Emma",
+    ]
+    assert(len(male_names) == len(female_names))
+    replaced_male = []
+    replaced_female = []
 
-def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False, model=None):
+    for idx, t in enumerate(used_templates):
+        # Rotate one list such that different name pairs are used in different templates
+        female_names_rotated = deque(female_names)
+        female_names_rotated.rotate(idx)
+        for male_name, female_name in zip(male_names, female_names_rotated):
+            replaced_male.append(
+                t.safe_substitute(
+                    gendered_word           = male_name,
+                    gender_word_possesive   = gendered_options["male"]["gender_word_possessive"],
+                    he_she                  = gendered_options["male"]["he_she"],
+                    his_her                 = gendered_options["male"]["his_her"],
+                    occupation              = tokenizer.mask_token,
+                    occupation_ing          = tokenizer.mask_token,
+                    occupation_verb         = tokenizer.mask_token,
+                ) 
+            )
+            replaced_female.append(
+                t.safe_substitute(
+                    gendered_word           = female_name,
+                    gender_word_possesive   = gendered_options["female"]["gender_word_possessive"],
+                    he_she                  = gendered_options["female"]["he_she"],
+                    his_her                 = gendered_options["female"]["his_her"],
+                    occupation              = tokenizer.mask_token,
+                    occupation_ing          = tokenizer.mask_token,
+                    occupation_verb         = tokenizer.mask_token,
+                ) 
+            )
+            pass
+
+    assert(len(replaced_male)==len(replaced_female))
+    return replaced_male, replaced_female
+
+def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False, model=None, use_names=False):
     used_templates = [t for t in gender_occupation_templates if "${occupation}" in t.template]
 
     # replace gendered placeholders with male choices
@@ -276,6 +339,11 @@ def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False
             occupation_verb         = tokenizer.mask_token,
         ) 
         for t in used_templates]
+    
+    if use_names:
+        replaced_male_names, replaced_female_names = _create_templates_with_names(used_templates, tokenizer)
+        replaced_male.extend(replaced_male_names)
+        replaced_female.extend(replaced_female_names)
 
     # Add period if needed
     replaced_male = [s+"." if not s.endswith(".") else s for s in replaced_male]

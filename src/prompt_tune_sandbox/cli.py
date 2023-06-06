@@ -168,8 +168,26 @@ def train_model(
         loss_type: LossFunctionType = LossFunctionType.equal_valid_options_mask_logits,
         position_ids_adjustment: PositionIdAdjustmentType = PositionIdAdjustmentType.none,
         gender_specific_options: bool = False,
+        use_names: bool = False,
+        prompt_init_text: str = None,
         hub_repo_prefix: str= None
         ):
+
+    if prompt_init_text is not None:
+        console.print(
+            """
+            [bold yellow] [WARNING] Initialization of prompts with text might require some local changes in the PEFT library. (at least for version 0.2.0)
+                At `peft/tuning/prompt_tuning.py:103` the `add_special_tokens=False` parameter should be passed to the `tokenizer` call.
+                Otherwise, the first prompt token will always be initialized with the embedding of `[CLS]`.
+            """
+        )
+    if position_ids_adjustment != PositionIdAdjustmentType.none:
+        console.print(
+            """
+            [bold yellow] [WARNING] Adjustment of position ids might require some local changes in the PEFT library. (at least for version 0.2.0)
+                The `if` block at `peft/peft_model.py:388` should be commented out.
+            """
+        )
 
     # Create tensorboard writer
     writer = SummaryWriter(log_dir=f"./runs/{experiment_name}")
@@ -184,7 +202,7 @@ def train_model(
 
     # Load training dataset
     with console.status(f"Loading training dataset..."):
-        occupation_dataset = prepare_dataset_for_masked_model(tokenizer, False, model)
+        occupation_dataset = prepare_dataset_for_masked_model(tokenizer, False, model, use_names=use_names)
         occupation_dataset.set_format("torch")
         console.log("Training dataset loaded")
 
@@ -192,29 +210,41 @@ def train_model(
     with console.status(f"Evaluating original model..."):
         bias_evaluator = BiasEvaluatorForBert()
         model.eval()
-        evaluation_initial_results = bias_evaluator.evaluate(model, tokenizer, return_stereo_set_results=True)
-        add_results_to_tensorboard(writer, evaluation_initial_results, 0)
+        evaluation_initial_results = bias_evaluator.evaluate(model, tokenizer, return_stereo_set_results=True, return_embeddings=False)
+        # Results will be added to tensorboard after computing the closest words to the initial prompts
         dump_predictions_on_training_dataset(model, tokenizer, 10, 0, out_file_sents=f"./runs/{experiment_name}/predictions_before.html")
         console.log("Finished evaluation of initial model")
 
     # Convert the model to use prompt tuning
     with console.status("Converting the model for prompt tuning..."):
-        peft_config = peft.PromptTuningConfig(
-            task_type="SEQ_CLS", num_virtual_tokens=prompt_length)
+        if prompt_init_text is not None:
+            peft_config = peft.PromptTuningConfig(
+                task_type="SEQ_CLS", num_virtual_tokens=prompt_length, prompt_tuning_init=peft.PromptTuningInit.TEXT, prompt_tuning_init_text=prompt_init_text, tokenizer_name_or_path=model_name)
+        else:
+            peft_config = peft.PromptTuningConfig(
+                task_type="SEQ_CLS", num_virtual_tokens=prompt_length)
         model = peft.get_peft_model(model, peft_config)
         model = model.to(device)
+        assert(model.get_prompt_embedding_to_save().size(0) == prompt_length)
         console.log("Converted model for prompt tuning")
         model.train()
         model.print_trainable_parameters()
+
+    evaluation_initial_results["closest_k_words"] = bias_evaluator.evaluate(
+        model, tokenizer, return_seat_results=False, return_occupation_dataset_results=False, return_words_close_to_prompts=True)["closest_k_words"]
+    add_results_to_tensorboard(writer, evaluation_initial_results, 0)
 
     NUM_EPOCHS = num_epochs
     LEARNING_RATE = 1e-2
     VALID_DATASET_RATIO = 0.05
     BATCH_SIZE = 16
-    dataset_split = occupation_dataset.train_test_split(test_size=VALID_DATASET_RATIO)
-    
-    train_loader = DataLoader(dataset_split["train"], batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(dataset_split["test"], batch_size=BATCH_SIZE)
+    USE_TRAIN_VALIDATION_SPLIT=False
+    if USE_TRAIN_VALIDATION_SPLIT:
+        dataset_split = occupation_dataset.train_test_split(test_size=VALID_DATASET_RATIO)
+        train_loader = DataLoader(dataset_split["train"], batch_size=BATCH_SIZE, shuffle=True)
+        test_loader = DataLoader(dataset_split["test"], batch_size=BATCH_SIZE)
+    else:
+        train_loader = DataLoader(occupation_dataset, batch_size=BATCH_SIZE, shuffle=True)
     optim = AdamW(model.parameters(), lr=LEARNING_RATE)
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optim,
@@ -273,6 +303,7 @@ def train_model(
             raise RuntimeError("Loss was not computed")
         return loss
 
+    loss_print_interval = max(min(NUM_EPOCHS//10, 10), 1)
 
     console.rule("START OF TRAINING")
 
@@ -287,18 +318,21 @@ def train_model(
 
             optim.step()
             lr_scheduler.step()
-        with torch.no_grad():
-            model.eval()
-            for batch in test_loader:
-                loss_test = compute_loss(batch)
-                test_losses_in_batch.append(loss_test.item())
-            model.train()
+
+        if USE_TRAIN_VALIDATION_SPLIT:
+            with torch.no_grad():
+                model.eval()
+                for batch in test_loader:
+                    loss_test = compute_loss(batch)
+                    test_losses_in_batch.append(loss_test.item())
+                model.train()
             
 
         writer.add_scalar("Loss/train", np.mean(losses_in_batch), epoch)
-        writer.add_scalar("Loss/test", np.mean(test_losses_in_batch), epoch)
+        if USE_TRAIN_VALIDATION_SPLIT:
+            writer.add_scalar("Loss/test", np.mean(test_losses_in_batch), epoch)
 
-        if epoch % 10 == 0:
+        if epoch % loss_print_interval == 0:
             console.log(f"Loss in epoch {epoch}: {np.mean(losses_in_batch)}")
         if epoch % eval_interval == 0:
             model.eval()
@@ -321,6 +355,8 @@ def train_model(
         "num_epochs": num_epochs,
         "loss_type": loss_type,
         "position_ids_adjustment": position_ids_adjustment,
+        "use_names_in_training_data": use_names,
+        "prompt_init_string": str(prompt_init_text),
         "learning_rate": LEARNING_RATE,
         "valid_set_ratio": VALID_DATASET_RATIO,
         "batch_size": BATCH_SIZE,
