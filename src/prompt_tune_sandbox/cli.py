@@ -173,6 +173,8 @@ def train_model(
         hub_repo_prefix: str= None
         ):
 
+    is_roberta = "roberta" in model_name
+
     if prompt_init_text is not None:
         console.print(
             """
@@ -202,7 +204,7 @@ def train_model(
 
     # Load training dataset
     with console.status(f"Loading training dataset..."):
-        occupation_dataset = prepare_dataset_for_masked_model(tokenizer, False, model, use_names=use_names)
+        occupation_dataset = prepare_dataset_for_masked_model(tokenizer, False, model, use_names=use_names, prepare_for_roberta=is_roberta)
         occupation_dataset.set_format("torch")
         console.log("Training dataset loaded")
 
@@ -405,7 +407,8 @@ def dump_predictions_on_training_dataset(
     out_file_sents="",
     out_file_predictions="",
     ):
-    occupation_dataset, male_sentences, female_sentences = prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=True)
+    is_roberta = "roberta" in model.name_or_path
+    occupation_dataset, male_sentences, female_sentences = prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=True, prepare_for_roberta=is_roberta)
     occupation_dataset.set_format("torch")
     device = model.device
     input_ids_male = occupation_dataset["input_ids_male"].to(device)

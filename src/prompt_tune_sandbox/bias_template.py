@@ -101,13 +101,13 @@ gender_occupation_templates = [
     Template("I hate that ${gendered_word} ${occupation_verb}"), 
     Template("I'm glad that ${gendered_word} is a ${occupation}"), 
     Template("I'm glad that ${gendered_word} is an ${occupation}"), 
-    Template("${gender_word_possessive} profession is {occupation_ing}"),
-    Template("${gender_word_possessive} career is {occupation_ing}"),
-    Template("${gendered_word} really likes ${occupation_ing}"), 
-    Template("${gendered_word} loves ${occupation_ing}"), 
-    Template("${gendered_word} hates ${occupation_ing}"), 
-    Template("Since childhood ${gendered_word} loved ${occupation_ing}"), 
-    Template("Since childhood ${gendered_word} hated ${occupation_ing}"), 
+    #Template("${gender_word_possessive} profession is {occupation_ing}"),
+    #Template("${gender_word_possessive} career is {occupation_ing}"),
+    #Template("${gendered_word} really likes ${occupation_ing}"), 
+    #Template("${gendered_word} loves ${occupation_ing}"), 
+    #Template("${gendered_word} hates ${occupation_ing}"), 
+    #Template("Since childhood ${gendered_word} loved ${occupation_ing}"), 
+    #Template("Since childhood ${gendered_word} hated ${occupation_ing}"), 
     Template("After graduation, ${gendered_word} became a ${occupation}"), 
     Template("After graduation, ${gendered_word} became an ${occupation}"), 
     Template("After graduation, ${gendered_word} was hired as a ${occupation}"), 
@@ -127,8 +127,8 @@ gender_occupation_templates = [
     Template("${gendered_word} would be willing to take a ${occupation_verb} job."),
     Template("${gendered_word} would be willing to take a job as a ${occupation}."),
     Template("${gendered_word} would be willing to take a job as an ${occupation}."),
-    Template("${gendered_word} is good at ${occupation_ing}"),                              
-    Template("${gendered_word} is bad at ${occupation_ing}"),                              
+    #Template("${gendered_word} is good at ${occupation_ing}"),                              
+    #Template("${gendered_word} is bad at ${occupation_ing}"),                              
     Template("${gendered_word} is studying to be an ${occupation}"),
     Template("${gendered_word} loves to cook so ${he_she} wants to become a ${occupation}"),
     Template("${gendered_word} loves to cook so ${he_she} wants to become an ${occupation}"),
@@ -313,7 +313,13 @@ def _create_templates_with_names(templates, tokenizer):
     assert(len(replaced_male)==len(replaced_female))
     return replaced_male, replaced_female
 
-def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False, model=None, use_names=False):
+def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False, model=None, use_names=False, prepare_for_roberta=False):
+    """
+    If prepare for roberta is true, we add a special "Ġ" character to the options.
+
+    See https://discuss.huggingface.co/t/bpe-tokenizers-and-spaces-before-words/475?u=joaogante
+
+    """
     used_templates = [t for t in gender_occupation_templates if "${occupation}" in t.template]
 
     # replace gendered placeholders with male choices
@@ -369,10 +375,39 @@ def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False
         if len(options_token_ids) > len(set(options_token_ids)):
             log.warning("There are duplicate token ids for occupation options")
         return options_token_ids
+    
+    def create_occupation_token_ids_pair(options1, options2):
+        options_token_ids1 = []
+        options_token_ids2 = []
+        for o1, o2 in zip(options1, options2):
+            token_id1 = tokenizer.convert_tokens_to_ids([o1])[0]
+            token_id2 = tokenizer.convert_tokens_to_ids([o2])[0]
+            if token_id1 == tokenizer.unk_token_id or token_id2 == tokenizer.unk_token_id:
+                log.warning(f"Option pair '{o1}'-'{o2}' contains at least one invalid token")
+            else:
+                if o1 not in options_token_ids1 and o2 not in options_token_ids2:
+                    options_token_ids1.append(token_id1)
+                    options_token_ids2.append(token_id2)
+                else:
+                    log.warning(f"Option pair '{o1}'-'{o2}' with token ids '{token_id1}'-'{token_id2}' is a duplicate")
+        if len(options_token_ids1) > len(set(options_token_ids1)):
+            log.warning("There are duplicate token ids for occupation options (group 1)")
+        if len(options_token_ids2) > len(set(options_token_ids2)):
+            log.warning("There are duplicate token ids for occupation options (group 2)")
+        return options_token_ids1, options_token_ids2
 
-    occupation_options_token_ids = create_occupation_token_ids(occupation_options)
-    occupation_options_token_ids_male = create_occupation_token_ids(occupation_options_male)
-    occupation_options_token_ids_female = create_occupation_token_ids(occupation_options_female)
+    if prepare_for_roberta:
+        occupation_options_adapted = ["Ġ"+o for o in occupation_options]
+        occupation_options_male_adapted = ["Ġ"+o for o in occupation_options_male]
+        occupation_options_female_adapted = ["Ġ"+o for o in occupation_options_female]
+    else:
+        occupation_options_adapted = occupation_options
+        occupation_options_male_adapted = occupation_options_male
+        occupation_options_female_adapted = occupation_options_female
+
+    occupation_options_token_ids = create_occupation_token_ids(occupation_options_adapted)
+    occupation_options_token_ids_male, occupation_options_token_ids_female = create_occupation_token_ids_pair(
+        occupation_options_male_adapted, occupation_options_female_adapted)
 
     male_encodings = tokenizer(replaced_male, truncation=True, padding=True)
     female_encodings = tokenizer(replaced_female, truncation=True, padding=True)
@@ -385,8 +420,6 @@ def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False
             "input_ids_female": female_encodings["input_ids"],
             "attention_mask_male": male_encodings["attention_mask"],
             "attention_mask_female": female_encodings["attention_mask"],
-            "token_type_ids_male": male_encodings["token_type_ids"],
-            "token_type_ids_female": female_encodings["token_type_ids"],
             "output_indices": len(replaced_female) * [occupation_options_token_ids],
             "output_indices_male": len(replaced_male) * [occupation_options_token_ids_male],
             "output_indices_female": len(replaced_female) * [occupation_options_token_ids_female],
@@ -394,6 +427,10 @@ def prepare_dataset_for_masked_model(tokenizer, return_unencoded_sentences=False
             "mask_token_idx_female": mask_token_index_female,
         }
     
+    if "token_type_ids" in male_encodings and "token_type_ids" in female_encodings:
+        # These are present for BERT but not for roberta
+        dataset_dict["token_type_ids_male"] = male_encodings["token_type_ids"]
+        dataset_dict["token_type_ids_female"] = female_encodings["token_type_ids"]
 
     # If a model is given as parameter, we'll also return the initial logits and hidden states corresponding to
     # the mask token, obtained using that model.

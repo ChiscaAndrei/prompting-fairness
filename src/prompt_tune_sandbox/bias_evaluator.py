@@ -140,7 +140,9 @@ class BiasEvaluatorForBert:
 
     @torch.no_grad()
     def evaluate_training_occupation_dataset(self, model, tokenizer, prompt_length, position_id_adjustment=PositionIdAdjustmentType.none):
-        dataset = prepare_dataset_for_masked_model(tokenizer)
+        is_roberta = "roberta" in model.name_or_path
+
+        dataset = prepare_dataset_for_masked_model(tokenizer, prepare_for_roberta=is_roberta)
         dataset.set_format("torch")
         device = model.device
 
@@ -205,7 +207,10 @@ class BiasEvaluatorForBert:
 
     @torch.no_grad()
     def find_k_closest_words(self, model, tokenizer, k=5):
-        word_embeddings : torch.nn.Embedding = model.bert.embeddings.word_embeddings
+        if "roberta" in model.name_or_path:
+            word_embeddings : torch.nn.Embedding = model.roberta.embeddings.word_embeddings
+        else:
+            word_embeddings : torch.nn.Embedding = model.bert.embeddings.word_embeddings
         embedding_values = word_embeddings.weight.detach().cpu().numpy()
         # shape: [vocab_size, hidden_size]
         prompt_embeddings = model.get_prompt_embedding_to_save().numpy()
@@ -227,6 +232,7 @@ class BiasEvaluatorForBert:
         runner = StereoSetRunner(
             model,
             tokenizer,
+            model_name_or_path=model.name_or_path,
             input_file=stereo_set_dataset_path,
             batch_size=1,
             max_seq_length=128,
